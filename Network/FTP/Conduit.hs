@@ -52,9 +52,7 @@ import Data.Word
 import Data.Conduit
 import Data.Conduit.Binary (sourceHandle, sinkHandle)
 import Data.Bits
-import Data.Typeable
-import Network.URI
-import Control.Exception
+import Network.URI (URI(..), URIAuth(..))
 import Data.ByteString (ByteString)
 import Network.Socket hiding (connect)
 import Network.Utils
@@ -65,6 +63,7 @@ import System.ByteOrder
 -- | 'UnexpectedCode' has the form (Expected code, full response string)
 data FTPError = UnexpectedCode Int String
                 | GeneralError String
+                | IncorrectScheme String
   deriving (Show)
 instance Error FTPError where
   noMsg  = GeneralError ""
@@ -74,6 +73,7 @@ hton_16 :: Word16 -> Word16
 hton_16 x = case byteOrder of
   BigEndian -> x
   LittleEndian -> x `shiftL` 8 + x `shiftR` 8
+  _ -> undefined
 
 extractCode :: String -> Int
 extractCode = read . (takeWhile (/= ' '))
@@ -111,9 +111,9 @@ connectDownloadToSink uri sink = do
 cleanUp :: ReleaseKey -> ReleaseKey -> Handle -> ResourceT (ErrorT FTPError IO) ()
 cleanUp release_control release_data handle= do
   release release_data
-  readExpected handle 226
+  _ <- readExpected handle 226
   writeLine handle "QUIT"
-  readExpected handle 221
+  _ <- readExpected handle 221
   release release_control
   return ()
 
@@ -122,17 +122,18 @@ setupHandleForFTP URI { uriScheme = scheme
                       , uriAuthority = authority
                       , uriPath = path
                       } iomode = do 
+  if scheme /= "ftp:" then lift (throwError (IncorrectScheme scheme)) else return ()
   s <- liftIO $ connectTCP host (PortNum (hton_16 port))
   h <- liftIO $ socketToHandle s ReadWriteMode
   liftIO $ hSetBuffering h LineBuffering
   release_control <- register $ liftIO $ hClose h
-  readExpected h 220
+  _ <- readExpected h 220
   writeLine h $ "USER " ++ user
-  readExpected h 331
+  _ <- readExpected h 331
   writeLine h $ "PASS " ++ pass
-  readExpected h 230
+  _ <- readExpected h 230
   writeLine h "TYPE I"
-  readExpected h 200
+  _ <- readExpected h 200
   writeLine h "PASV"
   pasv_response <- readExpected h 227
   let (pasvhost, pasvport) = parsePasvString pasv_response
@@ -143,9 +144,9 @@ setupHandleForFTP URI { uriScheme = scheme
   return (h, dh, path, release_control, release_data)
   where (host, port, user, pass) = case authority of
           Nothing -> undefined
-          Just (URIAuth userInfo regName port) ->
+          Just (URIAuth userInfo regName port') ->
             ( regName
-            , if null port then 21 else read (tail port)
+            , if null port' then 21 else read (tail port')
             , if null userInfo then "anonymous" else takeWhile (\ l -> l /= ':' && l /= '@') userInfo
             , if null userInfo || not (':' `elem` userInfo) then "" else init $ tail $ (dropWhile (/= ':')) userInfo
             )
@@ -162,7 +163,7 @@ putFTPFile :: URI -> ResourceT (ErrorT FTPError IO) (Handle, (Sink ByteString (E
 putFTPFile uri = do
   (h, dh, path, release_control, release_data) <- setupHandleForFTP uri WriteMode
   writeLine h $ "STOR " ++ path
-  readExpected h 150
+  _ <- readExpected h 150
   return $ (h, sinkHandle dh, release_control, release_data)
 
 -- | Returns (Handle of the control connection, the Source itself,
@@ -173,5 +174,5 @@ getFTPFile :: URI -> ResourceT (ErrorT FTPError IO) (Handle, (Source (ErrorT FTP
 getFTPFile uri = do
   (h, dh, path, release_control, release_data) <- setupHandleForFTP uri ReadMode
   writeLine h $ "RETR " ++ path
-  readExpected h 150
+  _ <- readExpected h 150
   return $ (h, sourceHandle dh, release_control, release_data)
