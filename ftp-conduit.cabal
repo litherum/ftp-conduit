@@ -21,6 +21,7 @@ library
                  , MissingH              >= 0.18.6
                  , mtl                   >= 1.0
                  , byteorder             >= 1.0.0
+                 , utf8-string           >= 0.3
     exposed-modules: Network.FTP.Conduit
     ghc-options:     -Wall
 
