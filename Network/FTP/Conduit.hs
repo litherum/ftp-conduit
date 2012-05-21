@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 -- | This module contains code to use files on a remote FTP server as
 -- Sources and Sinks.
 --
@@ -9,8 +10,8 @@
 -- the server can send unexpected replies, which are thrown as errors.
 module Network.FTP.Conduit
   ( createSink
-  , createSource
-  , FTPError(..)
+--  , createSource
+  , FTPException(..)
   ) where
 
 import Data.Conduit
@@ -20,21 +21,21 @@ import Network.Socket hiding (send, sendTo, recv, recvFrom, Closed)
 import Network.Socket.ByteString
 import Network.URI
 import Network.Utils
-import Control.Monad.Error
+import Control.Exception
 import Data.Word
 import System.ByteOrder
 import Data.Bits
 import Prelude hiding (getLine)
-import Control.Monad.Trans.Resource
+import Control.Monad.Trans
+import Data.Typeable
 
-data FTPError = UnexpectedCode Int BS.ByteString
-                | GeneralError String
-                | IncorrectScheme String
-                | SocketClosed
-  deriving (Show)
-instance Error FTPError where
-  noMsg  = GeneralError ""
-  strMsg = GeneralError
+data FTPException = UnexpectedCode Int BS.ByteString
+                  | GeneralError String
+                  | IncorrectScheme String
+                  | SocketClosed
+  deriving (Typeable, Show)
+
+instance Exception FTPException
 
 hton_16 :: Word16 -> Word16
 hton_16 x = case byteOrder of
@@ -42,12 +43,12 @@ hton_16 x = case byteOrder of
   LittleEndian -> x `shiftL` 8 + x `shiftR` 8
   _ -> undefined
 
-getByte :: Socket -> ResourceT (ErrorT FTPError IO) Word8
+getByte :: Socket -> IO Word8
 getByte s = do
-  b <- lift $ lift $ recv s 1
-  if BS.null b then lift (throwError SocketClosed) else return $ BS.head b
+  b <- recv s 1
+  if BS.null b then throw SocketClosed else return $ BS.head b
 
-getLine :: Socket -> ResourceT (ErrorT FTPError IO) BS.ByteString
+getLine :: Socket -> IO BS.ByteString
 getLine s = do
   b <- getByte s
   helper b
@@ -60,75 +61,64 @@ getLine s = do
 extractCode :: BS.ByteString -> Int
 extractCode = read . toString . (BS.takeWhile (/= 32))
 
-readExpected :: Socket -> Int -> ResourceT (ErrorT FTPError IO) BS.ByteString
+readExpected :: Socket -> Int -> IO BS.ByteString
 readExpected s i = do
   line <- getLine s
-  --lift $ lift $ putStrLn $ "Read: " ++ (toString line)
+  --putStrLn $ "Read: " ++ (toString line)
   if extractCode line /= i
-    then lift $ throwError $ UnexpectedCode i line
+    then throw $ UnexpectedCode i line
     else return line
 
-writeLine :: Socket -> BS.ByteString -> ResourceT (ErrorT FTPError IO) ()
-writeLine s bs = lift $ lift $ do
-  --lift $ lift $ putStrLn $ "Writing: " ++ (toString bs)
+writeLine :: Socket -> BS.ByteString -> IO ()
+writeLine s bs = do
+  --putStrLn $ "Writing: " ++ (toString bs)
   sendAll s $ bs `BS.append` (fromString "\r\n") -- hardcode the newline for platform independence
 
-createSource :: URI -> Source (ErrorT FTPError IO) BS.ByteString
-createSource uri = Source { sourcePull = pull
-                           , sourceClose = close
-                           }
-
-  where pull = do
-          (c, rc, d, rd, path') <- common uri
+createSource :: MonadResource m => URI -> Source m BS.ByteString
+createSource uri = sourceIO setup close pull
+  where setup = do
+          (c, d, path') <- common uri
           writeLine c $ fromString $ "RETR " ++ path'
           _ <- readExpected c 150
-          pull' c rc d rd
-        pull' c rc d rd= do
-          bytes <- lift $ lift $ recv d 1024
+          return (c, d)
+        close (c, d) = do
+          sClose d
+          _ <- readExpected c 226
+          writeLine c $ fromString "QUIT"
+          _ <- readExpected c 221
+          sClose c
+        pull (c, d) = liftIO $ do
+          bytes <- recv d 1024
           if BS.null bytes
             then do
-              close' c rc d rd
-              return Closed
-            else do
-              return $ Open (Source { sourcePull = pull' c rc d rd
-                                    , sourceClose = close' c rc d rd
-                                    }) bytes
-        close = return ()
-        close' c rc _ rd = do
-          release rd
-          _ <- readExpected c 226
-          writeLine c $ fromString "QUIT"
-          _ <- readExpected c 221
-          release rc
+              close (c, d)
+              return IOClosed
+            else return $ IOOpen bytes
 
-createSink :: URI -> Sink BS.ByteString (ErrorT FTPError IO) ()
-createSink uri = SinkData { sinkPush = push
-                           , sinkClose = close
-                           }
-  where push input = do
-          (c, rc, d, rd, path') <- common uri
+createSink :: MonadResource m => URI -> Sink BS.ByteString m ()
+createSink uri = sinkIO setup close push (liftIO . close)
+  where setup = do
+          (c, d, path') <- common uri
           writeLine c $ fromString $ "STOR " ++ path'
           _ <- readExpected c 150
-          push' c rc d rd input
-        push' c rc d rd input = do
-          lift $ lift $ sendAll d input
-          return $ Processing (push' c rc d rd) (close' c rc d rd)
-        close = return ()
-        close' c rc _ rd = do
-          release rd
+          return (c, d)
+        close (c, d) = do
+          sClose d
           _ <- readExpected c 226
           writeLine c $ fromString "QUIT"
           _ <- readExpected c 221
-          release rc
+          sClose c
+        push (c, d) input = liftIO $ do
+          sendAll d input
+          return IOProcessing
 
-common :: URI -> ResourceT (ErrorT FTPError IO) (Socket, ReleaseKey, Socket, ReleaseKey, String)
+common :: URI -> IO (Socket, Socket, String)
 common (URI { uriScheme = scheme'
        , uriAuthority = authority'
        , uriPath = path'
-       }) = do
-  if scheme' /= "ftp:" then lift (throwError (IncorrectScheme scheme')) else return ()
-  c <- lift $ lift $ connectTCP host (PortNum (hton_16 port))
-  rc <- register $ sClose c
+       }) = liftIO $ do
+  if scheme' /= "ftp:" then throw $ IncorrectScheme scheme' else return ()
+  c <- connectTCP host (PortNum (hton_16 port))
   _ <- readExpected c 220
   writeLine c $ fromString $ "USER " ++ user
   _ <- readExpected c 331
@@ -139,9 +129,8 @@ common (URI { uriScheme = scheme'
   writeLine c $ fromString "PASV"
   pasv_response <- readExpected c 227
   let (pasvhost, pasvport) = parsePasvString pasv_response
-  d <- lift $ lift $ connectTCP (toString pasvhost) (PortNum (hton_16 pasvport))
-  rd <- register $ sClose d
-  return (c, rc, d, rd, path')
+  d <- connectTCP (toString pasvhost) (PortNum (hton_16 pasvport))
+  return (c, d, path')
   where (host, port, user, pass) = case authority' of
           Nothing -> undefined
           Just (URIAuth userInfo regName port') ->
