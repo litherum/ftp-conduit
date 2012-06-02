@@ -1,16 +1,16 @@
 {-# LANGUAGE DeriveDataTypeable #-}
+
 -- | This module contains code to use files on a remote FTP server as
--- Sources and Sinks.
+--   Sources and Sinks.
 --
--- Using these functions looks like this:
+--   Using these functions looks like this:
+--
 -- > let uri = fromJust $ parseURI "ftp://ftp.kernel.org/pub/README_ABOUT_BZ2_FILES"
--- > runErrorT $ runResourceT $ createSource uri $$ consume
---
--- The functions here operate on the ErrorT monad transformer, because
--- the server can send unexpected replies, which are thrown as errors.
+-- > runResourceT $ createSource uri $$ consume
+
 module Network.FTP.Conduit
   ( createSink
---  , createSource
+  , createSource
   , FTPException(..)
   ) where
 
@@ -25,10 +25,11 @@ import Control.Exception
 import Data.Word
 import System.ByteOrder
 import Data.Bits
-import Prelude hiding (getLine)
-import Control.Monad.Trans
+import Prelude hiding (getLine, catch)
 import Data.Typeable
+import Control.Monad.IO.Class
 
+-- | Thrown if a FTP-level protocol exception happens
 data FTPException = UnexpectedCode Int BS.ByteString
                   | GeneralError String
                   | IncorrectScheme String
@@ -74,41 +75,46 @@ writeLine s bs = do
   --putStrLn $ "Writing: " ++ (toString bs)
   sendAll s $ bs `BS.append` (fromString "\r\n") -- hardcode the newline for platform independence
 
+close :: (Socket, Socket) -> IO ()
+close (c, d) = do
+  --putStrLn "Closing data connection"
+  sClose d
+  catch (do
+    _ <- readExpected c 226
+    writeLine c $ fromString "QUIT"
+    _ <- readExpected c 221
+    --putStrLn "Closing control connection"
+    sClose c
+    ) (\ e -> sClose c >> throw (e :: IOException))
+
+-- | Create a conduit source out of a 'URI'. Uses the @RETR@ command.
 createSource :: MonadResource m => URI -> Source m BS.ByteString
 createSource uri = sourceIO setup close pull
   where setup = do
           (c, d, path') <- common uri
-          writeLine c $ fromString $ "RETR " ++ path'
-          _ <- readExpected c 150
-          return (c, d)
-        close (c, d) = do
-          sClose d
-          _ <- readExpected c 226
-          writeLine c $ fromString "QUIT"
-          _ <- readExpected c 221
-          sClose c
-        pull (c, d) = liftIO $ do
-          bytes <- recv d 1024
+          catch (do
+            writeLine c $ fromString $ "RETR " ++ path'
+            _ <- readExpected c 150
+            return (c, d)
+            ) (\ e -> sClose d >> sClose c >> throw (e :: IOException))
+        pull (_, d) = liftIO $ do
+          bytes <- recv d 4096
           if BS.null bytes
             then do
-              close (c, d)
               return IOClosed
             else return $ IOOpen bytes
 
+-- | Create a conduit sink out of a 'URI'. Uses the @STOR@ command.
 createSink :: MonadResource m => URI -> Sink BS.ByteString m ()
 createSink uri = sinkIO setup close push (liftIO . close)
   where setup = do
           (c, d, path') <- common uri
-          writeLine c $ fromString $ "STOR " ++ path'
-          _ <- readExpected c 150
-          return (c, d)
-        close (c, d) = do
-          sClose d
-          _ <- readExpected c 226
-          writeLine c $ fromString "QUIT"
-          _ <- readExpected c 221
-          sClose c
-        push (c, d) input = liftIO $ do
+          catch (do
+            writeLine c $ fromString $ "STOR " ++ path'
+            _ <- readExpected c 150
+            return (c, d)
+            ) (\ e -> sClose d >> sClose c >> throw (e :: IOException))
+        push (_, d) input = liftIO $ do
           sendAll d input
           return IOProcessing
 
@@ -116,21 +122,25 @@ common :: URI -> IO (Socket, Socket, String)
 common (URI { uriScheme = scheme'
        , uriAuthority = authority'
        , uriPath = path'
-       }) = liftIO $ do
+       }) = do
   if scheme' /= "ftp:" then throw $ IncorrectScheme scheme' else return ()
+  --putStrLn "Opening control connection"
   c <- connectTCP host (PortNum (hton_16 port))
-  _ <- readExpected c 220
-  writeLine c $ fromString $ "USER " ++ user
-  _ <- readExpected c 331
-  writeLine c $ fromString $ "PASS " ++ pass
-  _ <- readExpected c 230
-  writeLine c $ fromString "TYPE I"
-  _ <- readExpected c 200
-  writeLine c $ fromString "PASV"
-  pasv_response <- readExpected c 227
-  let (pasvhost, pasvport) = parsePasvString pasv_response
-  d <- connectTCP (toString pasvhost) (PortNum (hton_16 pasvport))
-  return (c, d, path')
+  catch (do
+    _ <- readExpected c 220
+    writeLine c $ fromString $ "USER " ++ user
+    _ <- readExpected c 331
+    writeLine c $ fromString $ "PASS " ++ pass
+    _ <- readExpected c 230
+    writeLine c $ fromString "TYPE I"
+    _ <- readExpected c 200
+    writeLine c $ fromString "PASV"
+    pasv_response <- readExpected c 227
+    let (pasvhost, pasvport) = parsePasvString pasv_response
+    --putStrLn "Opening data connection"
+    d <- connectTCP (toString pasvhost) (PortNum (hton_16 pasvport))
+    return (c, d, path')
+    ) (\ e -> sClose c >> throw (e :: IOException))
   where (host, port, user, pass) = case authority' of
           Nothing -> undefined
           Just (URIAuth userInfo regName port') ->
